@@ -1477,6 +1477,9 @@ impl<'a> Socket<'a> {
         reply_repr.timestamp = repr
             .timestamp
             .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator));
+        if let Some(ts) = reply_repr.timestamp {
+            net_debug!("tcp: send ACK TS val={} ecr={} (delayed by pad)", ts.tsval, ts.tsecr);
+        }
 
         // From RFC 793:
         // [...] an empty acknowledgment segment containing the current send-sequence number
@@ -2165,9 +2168,20 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // update last remote tsval
+        // update last remote tsval — keep the earliest unacknowledged TSval
+        // for RFC 7323 compliance. Only update when we receive new data
+        // (seq advances past what we've already ACKed), not on duplicates
+        // or retransmissions. This ensures TSecr echoes the oldest
+        // unacknowledged segment, which is what the peer's kernel expects
+        // for RTT measurement.
         if let Some(timestamp) = repr.timestamp {
-            self.last_remote_tsval = timestamp.tsval;
+            let seg_end = repr.seq_number + repr.payload.len();
+            let should_update = self.remote_last_ack.map_or(true, |ack| {
+                seg_end > ack || repr.control == TcpControl::Syn
+            });
+            if should_update {
+                self.last_remote_tsval = timestamp.tsval;
+            }
         }
 
         // update timers.
@@ -2573,6 +2587,9 @@ impl<'a> Socket<'a> {
             ),
             payload: &[],
         };
+        if let Some(ts) = repr.timestamp {
+            net_debug!("tcp: dispatch ACK TS val={} ecr={}", ts.tsval, ts.tsecr);
+        }
 
         let mut is_zero_window_probe = false;
 
